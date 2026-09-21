@@ -13,6 +13,15 @@ class WeatherStation:
             "rainfall": rainfall
         }
 
+    def validate_data(self, data):
+        if not 0 <= data["humidity"] <= 100:
+            return False
+
+        if data["rainfall"] < 0:
+            return False
+
+        return True
+
 
 if __name__ == "__main__":
     station = WeatherStation()
@@ -20,3 +29,4 @@ if __name__ == "__main__":
     data = station.read_data()
 
     print(data)
+    print(station.validate_data(data))
