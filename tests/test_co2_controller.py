@@ -16,3 +16,14 @@ print("Start:", controller.start)
 print("Emergency stop:", controller.emergency_stop)
 
 print("Outputs:", controller.get_outputs())
+
+print("\nTesting emergency stop...")
+
+controller.update_inputs(
+    sensor1_co2=50.0,
+    sensor2_co2=30.0,
+    start=True,
+    emergency_stop=True
+)
+
+print("Emergency stop:", controller.emergency_stop)
