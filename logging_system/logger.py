@@ -1,6 +1,5 @@
 import csv
 import os
-from datetime import datetime
 
 
 class DataLogger:
@@ -25,8 +24,8 @@ class DataLogger:
                 ])
 
     def log_weather(self, data):
-        # 获取当前时间（带秒的 ISO 格式）
-        timestamp = datetime.now().isoformat(timespec="seconds")
+        # 使用气象站数据中的时间戳
+        timestamp = data["timestamp"]
 
         # 追加一行天气数据
         with open(self.filename, "a", newline="") as file:
@@ -37,11 +36,3 @@ class DataLogger:
                 data["temperature"],
                 data["rainfall"]
             ])
-if __name__ == "__main__":
-    # 临时测试：存到 logs 文件夹下的 weather.csv
-    logger = DataLogger("logs/weather.csv")
-    
-    # 模拟一次天气数据（实际会调用你的 WeatherStation）
-    test_data = {"humidity": 65.3, "temperature": 31.7, "rainfall": 1.39}
-    logger.log_weather(test_data)
-    print("数据已写入 CSV")

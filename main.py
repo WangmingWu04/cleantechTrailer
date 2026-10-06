@@ -10,24 +10,25 @@ def main():
     # 创建日志记录器（数据将保存到 logs/weather.csv）
     logger = DataLogger("logs/weather.csv")
 
-    print("气象站数据记录已启动，按 Ctrl+C 停止。")
+    print("Weather station data logging started. Press Ctrl+C to stop.")
 
     # 无限循环，每 5 秒记录一次
     try:
         while True:
-            # 1. 读取模拟数据
+            # 1. 读取真实天气数据
             data = station.read_data()
 
             # 2. 检查数据是否合理
             if not station.validate_data(data):
-                print("检测到无效的气象数据，跳过本次记录。")
+                print("Invalid weather data detected. Skipping this record.")
                 continue
 
             # 3. 打印到屏幕，方便观察
             print(
-                f"湿度: {data['humidity']}% | "
-                f"温度: {data['temperature']}°C | "
-                f"降雨: {data['rainfall']}mm"
+                f"Time: {data['timestamp']} | "
+                f"Humidity: {data['humidity']}% | "
+                f"Temperature: {data['temperature']}°F | "
+                f"Rainfall: {data['rainfall']}in"
             )
 
             # 4. 写入 CSV
@@ -37,7 +38,7 @@ def main():
             time.sleep(5)
 
     except KeyboardInterrupt:
-        print("\n气象站数据记录已停止。")
+        print("\nWeather station data logging stopped.")
 
 
 if __name__ == "__main__":
