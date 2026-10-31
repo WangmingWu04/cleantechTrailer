@@ -38,7 +38,7 @@ class App(tk.Tk):
         self.status_log_lock = threading.Lock()
         self.finalization_in_progress = False
         self.weather_stop_event = threading.Event()
-        self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
+        self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.csv_logging_error=None; self.csv_error_notified=False; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
         self.build(); self.after(100,self.poll); threading.Thread(target=self.discover,daemon=True).start()
 
     def build(self):
@@ -261,6 +261,7 @@ class App(tk.Tk):
         self.pi_g = 0
         self.prev_gps = None
         self.prev_ms = None
+        self.logging = False
 
         if not self.experiment_active:
             messagebox.showerror(
@@ -269,33 +270,100 @@ class App(tk.Tk):
             )
             return
 
-        path = self.experiment_manager.get_file_path("co2")
-        file_is_empty = not os.path.exists(path) or os.path.getsize(path) == 0
-        self.csvfile = open(path, 'a', newline='', encoding='utf-8')
-        self.writer = csv.writer(self.csvfile)
+        # Reset the error state for this new logging session.
+        self.csv_logging_error = None
+        self.csv_error_notified = False
 
-        if file_is_empty:
-            self.writer.writerow([
-                'Calculated Timestamp',
-                'Pi Receive Timestamp',
-                'Arduino Elapsed (ms)',
-                'Estimated Latency (ms)',
-                'CO2 (%)',
-                'Flow (SLPM)',
-                'Arduino CO2 (g)',
-                'Pi CO2 (g)',
-                'Difference (g)',
-                'Arduino CO2 (mol)',
-                'Pi CO2 (mol)'
-            ])
-            self.csvfile.flush()
+        # Do not overwrite an existing file reference if closing it failed.
+        if self.csvfile is not None:
+            try:
+                self.csvfile.close()
+                self.csvfile = None
+                self.writer = None
+            except Exception as e:
+                self.handle_csv_logging_error(
+                    OSError(f"Previous CSV file could not be closed: {e}")
+                )
+                return
 
-        self.logging = True
-        self.filelabel.set('Recording: ' + str(path))
+        try:
+            path = self.experiment_manager.get_file_path("co2")
+
+            file_is_empty = (
+                not os.path.exists(path)
+                or os.path.getsize(path) == 0
+            )
+
+            self.csvfile = open(
+                path,
+                'a',
+                newline='',
+                encoding='utf-8'
+            )
+
+            self.writer = csv.writer(self.csvfile)
+
+            if file_is_empty:
+                self.writer.writerow([
+                    'Calculated Timestamp',
+                    'Pi Receive Timestamp',
+                    'Arduino Elapsed (ms)',
+                    'Estimated Latency (ms)',
+                    'CO2 (%)',
+                    'Flow (SLPM)',
+                    'Arduino CO2 (g)',
+                    'Pi CO2 (g)',
+                    'Difference (g)',
+                    'Arduino CO2 (mol)',
+                    'Pi CO2 (mol)'
+                ])
+
+                self.csvfile.flush()
+
+            # Enable logging only after initialization succeeds.
+            self.logging = True
+            self.filelabel.set('Recording: ' + str(path))
+
+        except Exception as e:
+            self.handle_csv_logging_error(e)
 
     def close_csv(self):
         self.logging=False
         if self.csvfile:self.csvfile.close();self.csvfile=None;self.writer=None
+
+    def handle_csv_logging_error(self, error):
+        self.logging = False
+        self.csv_logging_error = str(error)
+
+        # Update the GUI to show that CSV data may be incomplete.
+        self.filelabel.set(
+            f"Logging Error: {self.csv_logging_error}"
+        )
+
+        # Attempt to close the local CSV file.
+        # Keep the references if closing fails so cleanup can be retried.
+        if self.csvfile is not None:
+            try:
+                self.csvfile.close()
+                self.csvfile = None
+                self.writer = None
+            except Exception as close_error:
+                self.csv_logging_error += (
+                    f"; file close also failed: {close_error}"
+                )
+                self.filelabel.set(
+                    f"Logging Error: {self.csv_logging_error}"
+                )
+
+        # Show only one warning for this logging failure.
+        if not self.csv_error_notified:
+            self.csv_error_notified = True
+            messagebox.showwarning(
+                "CO2 CSV Logging Error",
+                f"CSV recording has stopped:\n{self.csv_logging_error}\n\n"
+                "The CO2 experiment will continue, but its data may be incomplete."
+            )
+
     def live_data(self,p):
         try:
             co2=float(p[1]); flow=float(p[2])
@@ -303,28 +371,78 @@ class App(tk.Tk):
         except (ValueError, IndexError):
             pass
 
-    def data_row(self,p):
+    def data_row(self, p):
+        # Parse and process incoming Arduino data.
         try:
-            ms=int(p[1]);co2=float(p[2]);flow=float(p[3]);ag=float(p[4]);am=float(p[5])
-            receive_time=datetime.now().astimezone()
-            gps=(co2/100.0)*(flow/60.0)*CO2_G_PER_SL
-            if self.prev_gps is not None and self.prev_ms is not None and ms>=self.prev_ms:
-                self.pi_g+=(self.prev_gps+gps)/2.0*((ms-self.prev_ms)/1000.0)
-            self.prev_gps,self.prev_ms=gps,ms
-            pm=self.pi_g/CO2_MOLAR_MASS
+            ms = int(p[1])
+            co2 = float(p[2])
+            flow = float(p[3])
+            ag = float(p[4])
+            am = float(p[5])
+
+            receive_time = datetime.now().astimezone()
+            gps = (co2 / 100.0) * (flow / 60.0) * CO2_G_PER_SL
+
+            if (
+                self.prev_gps is not None
+                and self.prev_ms is not None
+                and ms >= self.prev_ms
+            ):
+                self.pi_g += (
+                    (self.prev_gps + gps) / 2.0
+                    * ((ms - self.prev_ms) / 1000.0)
+                )
+
+            self.prev_gps, self.prev_ms = gps, ms
+            pm = self.pi_g / CO2_MOLAR_MASS
+
             if self.sync_time is not None:
-                calculated_time=self.sync_time+timedelta(milliseconds=ms)
-                latency_ms=(receive_time-calculated_time).total_seconds()*1000.0
+                calculated_time = self.sync_time + timedelta(milliseconds=ms)
+                latency_ms = (
+                    receive_time - calculated_time
+                ).total_seconds() * 1000.0
             else:
-                calculated_time=receive_time
-                latency_ms=0.0
-            self.live.set(f'CO2 {co2:.4f} %    Flow {flow:.4f} SLPM')
-            self.totals.set(f'Pi CO2: {self.pi_g:.6f} g    Arduino CO2: {ag:.6f} g    Difference: {ag-self.pi_g:+.6f} g')
-            self.timing.set(f'Timing: SYNCHRONIZED   Arduino {ms/1000:.3f} s   Serial latency {latency_ms:.1f} ms')
-            if self.logging and self.writer:
-                self.writer.writerow([calculated_time.isoformat(timespec='milliseconds'),receive_time.isoformat(timespec='milliseconds'),ms,round(latency_ms,3),co2,flow,ag,self.pi_g,ag-self.pi_g,am,pm])
+                calculated_time = receive_time
+                latency_ms = 0.0
+
+            self.live.set(
+                f'CO2 {co2:.4f} %    Flow {flow:.4f} SLPM'
+            )
+            self.totals.set(
+                f'Pi CO2: {self.pi_g:.6f} g    '
+                f'Arduino CO2: {ag:.6f} g    '
+                f'Difference: {ag-self.pi_g:+.6f} g'
+            )
+            self.timing.set(
+                f'Timing: SYNCHRONIZED   Arduino {ms/1000:.3f} s   '
+                f'Serial latency {latency_ms:.1f} ms'
+            )
+
+        except Exception as e:
+            print("CO2 data processing error:", e)
+            return
+
+        # Handle CSV errors separately from data-processing errors.
+        if self.logging and self.writer:
+            try:
+                self.writer.writerow([
+                    calculated_time.isoformat(timespec='milliseconds'),
+                    receive_time.isoformat(timespec='milliseconds'),
+                    ms,
+                    round(latency_ms, 3),
+                    co2,
+                    flow,
+                    ag,
+                    self.pi_g,
+                    ag - self.pi_g,
+                    am,
+                    pm
+                ])
                 self.csvfile.flush()
-        except Exception: pass
+
+            except Exception as e:
+                self.handle_csv_logging_error(e)
+
     def handle_safety_config(self,p):
         try:
             temp,rh,rh_s,press,press_s,loss_s=p[2:8]

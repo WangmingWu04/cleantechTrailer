@@ -3,6 +3,7 @@ from controls.co2_controller import CO2Controller
 
 controller = CO2Controller()
 
+# Test normal input updates.
 controller.update_inputs(
     sensor1_co2=50.0,
     sensor2_co2=30.0,
@@ -10,15 +11,21 @@ controller.update_inputs(
     emergency_stop=False
 )
 
-print("Sensor 1:", controller.sensor1_co2)
-print("Sensor 2:", controller.sensor2_co2)
-print("Start:", controller.start)
-print("Emergency stop:", controller.emergency_stop)
+assert controller.sensor1_co2 == 50.0
+assert controller.sensor2_co2 == 30.0
+assert controller.start is True
+assert controller.emergency_stop is False
 
-print("Outputs:", controller.get_outputs())
+# Test initial output state.
+outputs = controller.get_outputs()
 
-print("\nTesting emergency stop...")
+assert isinstance(outputs, dict)
+assert all(output is False for output in outputs.values())
 
+print("PASS: Controller inputs are updated correctly.")
+print("PASS: All controller outputs are initially False.")
+
+# Test emergency stop input.
 controller.update_inputs(
     sensor1_co2=50.0,
     sensor2_co2=30.0,
@@ -26,4 +33,7 @@ controller.update_inputs(
     emergency_stop=True
 )
 
-print("Emergency stop:", controller.emergency_stop)
+assert controller.emergency_stop is True
+
+print("PASS: Emergency stop input is updated correctly.")
+print("\nALL CO2 CONTROLLER TESTS PASSED.")
