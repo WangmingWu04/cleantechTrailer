@@ -20,7 +20,11 @@ class WeatherStation:
             "applicationKey": self.application_key,
         }
 
-        response = requests.get(self.url, params=params)
+        response = requests.get(
+            self.url,
+            params=params,
+            timeout=10
+        )
         response.raise_for_status()
 
         devices = response.json()

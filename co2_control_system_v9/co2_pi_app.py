@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import csv, glob, os, re, threading, time, queue
+from logging_system.experiment_manager import ExperimentManager
+from logging_system.logger import DataLogger
+from sensors.weather import WeatherStation
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -9,9 +12,9 @@ except ImportError:
     serial = None
 
 BAUD=115200
-DATA_DIR=os.path.expanduser('~/CO2_Data')
 COMM_TIMEOUT=5.0
 HEARTBEAT_INTERVAL=1.0
+WEATHER_INTERVAL = 30.0
 CO2_MOLAR_MASS=44.01
 MOLAR_VOLUME_STP=22.414
 CO2_G_PER_SL=CO2_MOLAR_MASS/MOLAR_VOLUME_STP
@@ -24,8 +27,20 @@ class Device:
 
 class App(tk.Tk):
     def __init__(self):
-        super().__init__(); self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
-        os.makedirs(DATA_DIR,exist_ok=True); self.build(); self.after(100,self.poll); threading.Thread(target=self.discover,daemon=True).start()
+        super().__init__()
+        self.experiment_manager = ExperimentManager()
+        self.experiment_active = False
+        self.experiment_stopping = False
+        self.weather_station = None
+        self.weather_logger = None
+        self.weather_thread = None
+        self.last_weather_timestamp = None
+        self.status_log_lock = threading.Lock()
+        self.finalization_in_progress = False
+        self.weather_stop_event = threading.Event()
+        self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
+        self.build(); self.after(100,self.poll); threading.Thread(target=self.discover,daemon=True).start()
+
     def build(self):
         style=ttk.Style(); style.configure('Big.TLabel',font=('TkDefaultFont',20,'bold')); style.configure('Value.TLabel',font=('TkDefaultFont',16))
         nb=ttk.Notebook(self); nb.pack(fill='both',expand=True,padx=8,pady=8)
@@ -37,6 +52,13 @@ class App(tk.Tk):
         self.sensors=tk.StringVar(value='Temp -- C   RH -- %   Pressure -- psig'); ttk.Label(self.over,textvariable=self.sensors,style='Value.TLabel').pack(pady=8)
         ttk.Label(self.over,textvariable=self.last_control_message).pack(pady=4)
         b=ttk.Frame(self.over);b.pack(pady=25);ttk.Button(b,text='START',command=self.start).grid(row=0,column=0,padx=20,ipadx=30,ipady=15);ttk.Button(b,text='STOP / SHUTDOWN',command=self.stop).grid(row=0,column=1,padx=20,ipadx=20,ipady=15);ttk.Button(b,text='RESET SYSTEM',command=self.reset).grid(row=0,column=2,padx=20,ipadx=20,ipady=15)
+        self.retry_finalize_button = ttk.Button(
+            self.over,
+            text="RETRY FINALIZATION",
+            command=self.retry_finalize_experiment,
+            state="disabled"
+        )
+        self.retry_finalize_button.pack(pady=5)
         ttk.Label(self.manual,text='Manual controls require MODE,MANUAL and physical switch ON.',style='Value.TLabel').pack(pady=15)
         grid=ttk.Frame(self.manual);grid.pack(pady=10)
         for r,name in enumerate(['ADSORB','DESORB','BELLOWS_EVAC','BELLOWS_TANK','VACUUM','STATE_CHANGE']):
@@ -59,7 +81,7 @@ class App(tk.Tk):
         self.safety_config_status=tk.StringVar(value='Active safety configuration: waiting for SAFETY Arduino')
         ttk.Label(safety_box,textvariable=self.safety_config_status).grid(row=len(safety_labels)+1,column=0,columnspan=2,padx=10,pady=6)
         ttk.Label(self.settings,text='Safety settings are applied to the SAFETY Arduino for the current powered session.').pack(pady=4)
-        ttk.Label(self.settings,text='CSV folder: '+DATA_DIR).pack(pady=10)
+        ttk.Label(self.settings,text='CSV folder: ' + str(self.experiment_manager.data_dir)).pack(pady=10)
     def discover(self):
         if serial is None: self.status.set('pyserial is not installed'); return
         while True:
@@ -144,10 +166,40 @@ class App(tk.Tk):
         # Pi communication-loss detection: prominently flag it. Hardware safety remains independent.
         if 'CONTROL' in missing or 'SAFETY' in missing:self.safety.set('COMMUNICATION FAULT - check CONTROL/SAFETY connection')
         self.after(100,self.poll)
+
     def handle(self,role,line):
         p=line.split(',')
-        if role=='CONTROL' and (line.startswith('ERROR,') or line.startswith('OK,') or line.startswith('EMERGENCY,') or line.startswith('SHUTDOWN,')):
-            self.last_control_message.set('Controller response: '+line)
+
+        if role == 'CONTROL' and (
+            line.startswith('ERROR,')
+            or line.startswith('OK,')
+            or line.startswith('EMERGENCY,')
+            or line.startswith('SHUTDOWN,')
+        ):
+            self.last_control_message.set('Controller response: ' + line)
+
+            if line == 'SHUTDOWN,EVACUATION_STARTED':
+                self.experiment_stopping = True
+                self.log_status('CONTROL', line)
+                self.send('DATA', 'STOP_LOG')
+                self.close_csv()
+                print("Normal shutdown evacuation started.")
+
+            elif line == 'SHUTDOWN,COMPLETE':
+                self.log_status('CONTROL', line)
+                self.finalize_experiment('completed')
+
+            elif line == 'EMERGENCY,LOCKOUT':
+                self.log_status('CONTROL', line)
+                self.finalize_experiment('aborted')
+
+            elif line == 'EMERGENCY,EVACUATION_STARTED':
+                self.experiment_stopping = True
+                self.log_status('CONTROL', line)
+                self.send('DATA', 'STOP_LOG')
+                self.close_csv()
+                print("Emergency evacuation started. Weather collection continues.")
+
         if role=='CONTROL':
             if line.startswith('STATE,'):
                 phase=p[1]; self.set_phase(phase)
@@ -176,6 +228,7 @@ class App(tk.Tk):
                 if p[4] != 'NA': self.live.set(f'CO2 {float(p[4]):.4f} %    Flow {float(p[5]):.4f} SLPM')
             except (ValueError, IndexError): pass
         elif role=='DATA' and line.startswith('DATA,'): self.data_row(p)
+
     def set_phase(self,phase):
         old=self.current_phase; self.current_phase=phase
         safety_phase = phase if phase in ('ADSORB','EVACUATION','DESORB') else 'IDLE'
@@ -203,18 +256,43 @@ class App(tk.Tk):
         rtt_ms=(receive_time-self.sync_send_time).total_seconds()*1000.0
         self.open_csv()
         self.timing.set(f'Timing: SYNCHRONIZED   START RTT {rtt_ms:.1f} ms')
+
     def open_csv(self):
-        self.pi_g=0;self.prev_gps=None;self.prev_ms=None
-        base_time=self.sync_time or datetime.now().astimezone()
-        stamp=base_time.strftime('%Y-%m-%d_%H-%M-%S')
-        note=re.sub(r'[^A-Za-z0-9_-]+','_',self.note.get().strip()).strip('_')
-        name=stamp+('_'+note if note else '')+'_Desorb.csv'
-        path=os.path.join(DATA_DIR,name)
-        self.csvfile=open(path,'w',newline='')
-        self.writer=csv.writer(self.csvfile)
-        self.writer.writerow(['Calculated Timestamp','Pi Receive Timestamp','Arduino Elapsed (ms)','Estimated Latency (ms)','CO2 (%)','Flow (SLPM)','Arduino CO2 (g)','Pi CO2 (g)','Difference (g)','Arduino CO2 (mol)','Pi CO2 (mol)'])
-        self.logging=True
-        self.filelabel.set('Recording: '+path)
+        self.pi_g = 0
+        self.prev_gps = None
+        self.prev_ms = None
+
+        if not self.experiment_active:
+            messagebox.showerror(
+                "CO2 Logging Error",
+                "Cannot start CO2 logging: no active experiment."
+            )
+            return
+
+        path = self.experiment_manager.get_file_path("co2")
+        file_is_empty = not os.path.exists(path) or os.path.getsize(path) == 0
+        self.csvfile = open(path, 'a', newline='', encoding='utf-8')
+        self.writer = csv.writer(self.csvfile)
+
+        if file_is_empty:
+            self.writer.writerow([
+                'Calculated Timestamp',
+                'Pi Receive Timestamp',
+                'Arduino Elapsed (ms)',
+                'Estimated Latency (ms)',
+                'CO2 (%)',
+                'Flow (SLPM)',
+                'Arduino CO2 (g)',
+                'Pi CO2 (g)',
+                'Difference (g)',
+                'Arduino CO2 (mol)',
+                'Pi CO2 (mol)'
+            ])
+            self.csvfile.flush()
+
+        self.logging = True
+        self.filelabel.set('Recording: ' + str(path))
+
     def close_csv(self):
         self.logging=False
         if self.csvfile:self.csvfile.close();self.csvfile=None;self.writer=None
@@ -263,8 +341,281 @@ class App(tk.Tk):
             self.after(250,lambda:self.send('SAFETY','GET_CONFIG'))
         except ValueError:
             messagebox.showerror('Invalid safety setting','Check the safety limits and use HH:MM:SS for all safety delays.')
-    def start(self): self.send('CONTROL','MODE,AUTO');self.after(150,lambda:self.send('CONTROL','START'))
-    def stop(self): self.send('CONTROL','STOP')
+
+    def log_status(self, device, message):
+        if not self.experiment_active:
+            return
+
+        try:
+            status_path = self.experiment_manager.get_file_path("status")
+
+            timestamp = datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            )
+
+            with self.status_log_lock:
+                with open(status_path, "a", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerow([timestamp, device, message])
+                    file.flush()
+
+        except Exception as e:
+            print("Status logging error:", e)
+
+    def weather_loop(self):
+        while not self.weather_stop_event.is_set():
+            try:
+                data = self.weather_station.read_data()
+
+                if self.weather_station.validate_data(data):
+                    timestamp = data["timestamp"]
+
+                    if timestamp != self.last_weather_timestamp:
+                        self.weather_logger.log_weather(data)
+                        self.last_weather_timestamp = timestamp
+                        print("New weather data recorded:", timestamp)
+                    else:
+                        print("Duplicate weather data skipped:", timestamp)
+                else:
+                    print("Invalid weather data skipped.")
+
+            except Exception as e:
+                print("Weather data collection error:", e)
+
+            self.weather_stop_event.wait(WEATHER_INTERVAL)
+
+    def start(self):
+        if self.experiment_active:
+            messagebox.showwarning("Warning", "An experiment is already running.")
+            return
+
+        try:
+            self.experiment_manager.start_experiment(
+                experiment_name=self.note.get().strip()
+            )
+            self.experiment_active = True
+
+        except Exception as e:
+            messagebox.showerror(
+                "Experiment Start Error",
+                f"Could not start experiment:\n{e}"
+            )
+            return
+
+        # Initialize weather data collection
+        try:
+            self.weather_stop_event.clear()
+
+            self.weather_station = WeatherStation()
+
+            weather_path = self.experiment_manager.get_file_path("weather")
+            self.weather_logger = DataLogger(str(weather_path))
+
+            self.weather_thread = threading.Thread(
+                target=self.weather_loop,
+                daemon=True
+            )
+            self.weather_thread.start()
+
+            print("Weather data collection started.")
+
+        except Exception as e:
+            self.weather_station = None
+            self.weather_logger = None
+            self.weather_thread = None
+
+            print("Weather initialization failed:", e)
+            messagebox.showwarning(
+                "Weather Collection Warning",
+                f"Weather collection could not start:\n{e}\n\n"
+                "The CO2 experiment will continue without weather data."
+            )
+        self.send('CONTROL', 'MODE,AUTO')
+        self.after(150, lambda: self.send('CONTROL', 'START'))
+
+    def finalize_experiment(self, status):
+        if self.finalization_in_progress:
+            return
+
+        if not self.experiment_active:
+            return
+
+        if status not in ("completed", "aborted"):
+            raise ValueError("Invalid experiment finalization status.")
+
+        self.finalization_in_progress = True
+
+        print(f"Finalizing experiment: {status}")
+
+        # Stop weather collection
+        self.weather_stop_event.set()
+
+        # Wait until the weather thread exits
+        self.wait_for_weather_thread(status)
+
+    def _cleanup_experiment_collection(self):
+        """
+        Stop CO2 logging and release local weather collection resources.
+        This operation can be retried if cleanup fails.
+        """
+        # Request the DATA Arduino to stop logging.
+        # Note: send() does not confirm that the Arduino received the command.
+        self.send('DATA', 'STOP_LOG')
+
+        # Close the local CO2 CSV file.
+        self.close_csv()
+
+        # Clear weather collection references only after cleanup succeeds.
+        self.weather_station = None
+        self.weather_logger = None
+        self.weather_thread = None
+        self.last_weather_timestamp = None
+
+
+    def retry_finalize_experiment(self):
+        if self.finalization_in_progress:
+            return
+
+        status = getattr(self, "pending_finalization_status", None)
+        stage = getattr(self, "pending_finalization_stage", None)
+
+        if status not in ("completed", "aborted"):
+            return
+
+        if stage not in ("cleanup", "metadata"):
+            return
+
+        self.finalization_in_progress = True
+
+        try:
+            # Retry cleanup only if the previous cleanup failed.
+            if stage == "cleanup":
+                self._cleanup_experiment_collection()
+                self.pending_finalization_stage = "metadata"
+
+            # Save final experiment metadata.
+            self.experiment_manager.end_experiment(status=status)
+
+            # All finalization steps succeeded.
+            self.experiment_active = False
+            self.experiment_stopping = False
+            self.pending_finalization_status = None
+            self.pending_finalization_stage = None
+
+            self.retry_finalize_button.config(state="disabled")
+
+            print(f"Experiment finalized after retry: {status}")
+
+        except Exception as e:
+            self.finalization_in_progress = False
+
+            if getattr(self, "pending_finalization_stage", None) == "cleanup":
+                messagebox.showerror(
+                    "Cleanup Retry Failed",
+                    f"Could not complete experiment cleanup:\n{e}\n\n"
+                    "You can retry finalization again."
+                )
+            else:
+                self.pending_finalization_stage = "metadata"
+
+                messagebox.showerror(
+                    "Metadata Save Retry Failed",
+                    f"Could not save experiment metadata:\n{e}\n\n"
+                    "You can retry finalization again."
+                )
+
+            return
+
+        self.finalization_in_progress = False
+
+
+    def wait_for_weather_thread(self, status):
+        if self.weather_thread and self.weather_thread.is_alive():
+            self.after(
+                100,
+                lambda: self.wait_for_weather_thread(status)
+            )
+            return
+
+        try:
+            # First complete local cleanup.
+            self._cleanup_experiment_collection()
+
+        except Exception as e:
+            self.pending_finalization_status = status
+            self.pending_finalization_stage = "cleanup"
+            self.finalization_in_progress = False
+
+            self.retry_finalize_button.config(state="normal")
+
+            messagebox.showerror(
+                "Experiment Cleanup Error",
+                f"Experiment cleanup could not be completed:\n{e}\n\n"
+                "Click RETRY FINALIZATION to try again."
+            )
+            return
+
+        # Cleanup succeeded. Metadata saving is now a separate stage.
+        self.pending_finalization_stage = "metadata"
+
+        try:
+            self.experiment_manager.end_experiment(status=status)
+
+        except Exception as e:
+            self.pending_finalization_status = status
+            self.finalization_in_progress = False
+
+            self.retry_finalize_button.config(state="normal")
+
+            messagebox.showerror(
+                "Experiment Metadata Save Error",
+                f"Experiment cleanup succeeded, "
+                f"but metadata could not be saved:\n{e}\n\n"
+                "Click RETRY FINALIZATION to try again."
+            )
+            return
+
+        # All finalization steps succeeded.
+        self.experiment_active = False
+        self.experiment_stopping = False
+        self.pending_finalization_status = None
+        self.pending_finalization_stage = None
+
+        self.retry_finalize_button.config(state="disabled")
+
+        self.finalization_in_progress = False
+
+        print(f"Experiment finalized: {status}")
+
+    def stop(self):
+        if not self.experiment_active:
+            return
+
+        if self.experiment_stopping:
+            print("Experiment is already stopping.")
+            return
+
+        control_device = self.devices.get('CONTROL')
+
+        if not control_device or not control_device.alive:
+            messagebox.showwarning(
+                "Communication Error",
+                "Cannot stop the experiment: CONTROL Arduino is disconnected."
+            )
+            self.log_status(
+                "CONTROL",
+                "STOP_REQUEST_FAILED: controller disconnected"
+            )
+            return
+
+        self.experiment_stopping = True
+
+        self.log_status("CONTROL", "STOP_REQUESTED")
+
+        self.send('CONTROL', 'STOP')
+
+        print("Stop requested. Waiting for Arduino evacuation to complete.")
+
     def reset(self):
         if self.reset_pending: return
         self.reset_pending=True

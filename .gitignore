@@ -6,3 +6,5 @@ logs/
 ambient_raw.json
 .env
 .vscode/
+# Experiment data
+CO2_Data/
