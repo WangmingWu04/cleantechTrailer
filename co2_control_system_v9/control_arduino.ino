@@ -5,7 +5,8 @@ const char CONTROLLER_ID[] = "CONTROL";
 
 // Outputs
 const int bellowsEvac = 8;
-const int stateChange = 9;
+const int awhPin = 9;        // Atmospheric Water Harvesting system
+const int heaterPin = A2;     // Desorption heater
 const int adsorbPin = 4;
 const int desorbPin = 5;
 const int bellowsTank = 6;
@@ -45,7 +46,7 @@ byte cmdIdx = 0;
 void setup() {
   Serial.begin(115200);
   lcd.init(); lcd.backlight();
-  pinMode(bellowsEvac, OUTPUT); pinMode(stateChange, OUTPUT);
+  pinMode(bellowsEvac, OUTPUT); pinMode(awhPin, OUTPUT); pinMode(heaterPin, OUTPUT);
   pinMode(adsorbPin, OUTPUT); pinMode(desorbPin, OUTPUT);
   pinMode(bellowsTank, OUTPUT); pinMode(vacuumPin, OUTPUT);
   pinMode(onoffPin, INPUT); pinMode(safetyInputPin, INPUT);
@@ -158,12 +159,12 @@ void runAutomaticCycle() {
 
 void applyCycleOutputs() {
   if (cycleState == ADSORB) {
-    stopAllOutputs(); digitalWrite(adsorbPin, HIGH);
+    stopAllOutputs(); digitalWrite(adsorbPin, HIGH); digitalWrite(awhPin, HIGH);
   } else if (cycleState == EVACUATION) {
     applyEvacuationOutputs();
   } else {
     stopAllOutputs();
-    digitalWrite(stateChange, HIGH); digitalWrite(desorbPin, HIGH); digitalWrite(bellowsTank, HIGH);
+    digitalWrite(heaterPin, HIGH); digitalWrite(desorbPin, HIGH); digitalWrite(bellowsTank, HIGH);
     vacuumDelayPending = true; vacuumDelayStartMs = millis();
   }
 }
@@ -181,7 +182,7 @@ void updateVacuumDelay() {
 }
 
 void stopAllOutputs() {
-  digitalWrite(bellowsEvac, LOW); digitalWrite(stateChange, LOW);
+  digitalWrite(bellowsEvac, LOW); digitalWrite(awhPin, LOW); digitalWrite(heaterPin, LOW);
   digitalWrite(adsorbPin, LOW); digitalWrite(desorbPin, LOW);
   digitalWrite(bellowsTank, LOW); digitalWrite(vacuumPin, LOW);
   vacuumDelayPending = false;
@@ -250,7 +251,7 @@ void setOutput(char *data) {
   int pin=-1;
   if(!strcmp(name,"ADSORB"))pin=adsorbPin; else if(!strcmp(name,"DESORB"))pin=desorbPin;
   else if(!strcmp(name,"BELLOWS_EVAC"))pin=bellowsEvac; else if(!strcmp(name,"BELLOWS_TANK"))pin=bellowsTank;
-  else if(!strcmp(name,"VACUUM"))pin=vacuumPin; else if(!strcmp(name,"STATE_CHANGE"))pin=stateChange;
+  else if(!strcmp(name,"VACUUM"))pin=vacuumPin; else if(!strcmp(name,"AWH"))pin=awhPin; else if(!strcmp(name,"HEATER"))pin=heaterPin;
   if(pin<0){Serial.println(F("ERROR,UNKNOWN_OUTPUT"));return;} digitalWrite(pin,v);
   Serial.print(F("OK,OUTPUT,"));Serial.print(name);Serial.print(',');Serial.println(v);
 }
@@ -267,7 +268,7 @@ void sendStatus() {
   Serial.print(F(",SWITCH="));Serial.print(digitalRead(onoffPin)); Serial.print(F(",SAFETY="));Serial.print(digitalRead(safetyInputPin));
   Serial.print(F(",ADSORB="));Serial.print(digitalRead(adsorbPin)); Serial.print(F(",DESORB="));Serial.print(digitalRead(desorbPin));
   Serial.print(F(",BELLOWS_EVAC="));Serial.print(digitalRead(bellowsEvac)); Serial.print(F(",BELLOWS_TANK="));Serial.print(digitalRead(bellowsTank));
-  Serial.print(F(",VACUUM="));Serial.print(digitalRead(vacuumPin)); Serial.print(F(",STATE_CHANGE="));Serial.println(digitalRead(stateChange));
+  Serial.print(F(",VACUUM="));Serial.print(digitalRead(vacuumPin)); Serial.print(F(",AWH="));Serial.print(digitalRead(awhPin)); Serial.print(F(",HEATER="));Serial.println(digitalRead(heaterPin));
 }
 
 unsigned long getRemainingS(){

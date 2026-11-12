@@ -39,19 +39,90 @@ class App(tk.Tk):
         self.finalization_in_progress = False
         self.weather_stop_event = threading.Event()
         self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.csv_logging_error=None; self.csv_error_notified=False; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
+        self.output_status_vars = {}
         self.build(); self.after(100,self.poll); threading.Thread(target=self.discover,daemon=True).start()
 
     def build(self):
-        style=ttk.Style(); style.configure('Big.TLabel',font=('TkDefaultFont',20,'bold')); style.configure('Value.TLabel',font=('TkDefaultFont',16))
-        nb=ttk.Notebook(self); nb.pack(fill='both',expand=True,padx=8,pady=8)
-        self.over=ttk.Frame(nb); self.manual=ttk.Frame(nb); self.data=ttk.Frame(nb); self.settings=ttk.Frame(nb)
-        for f,n in [(self.over,'Overview'),(self.manual,'Manual Control'),(self.data,'Data'),(self.settings,'Settings')]: nb.add(f,text=n)
-        self.status=tk.StringVar(value='Discovering Arduinos...'); ttk.Label(self.over,textvariable=self.status,style='Big.TLabel').pack(pady=20)
-        self.phase=tk.StringVar(value='State: IDLE'); ttk.Label(self.over,textvariable=self.phase,style='Value.TLabel').pack(pady=8)
-        self.safety=tk.StringVar(value='Safety: UNKNOWN'); ttk.Label(self.over,textvariable=self.safety,style='Value.TLabel').pack(pady=8)
-        self.sensors=tk.StringVar(value='Temp -- C   RH -- %   Pressure -- psig'); ttk.Label(self.over,textvariable=self.sensors,style='Value.TLabel').pack(pady=8)
-        ttk.Label(self.over,textvariable=self.last_control_message).pack(pady=4)
-        b=ttk.Frame(self.over);b.pack(pady=25);ttk.Button(b,text='START',command=self.start).grid(row=0,column=0,padx=20,ipadx=30,ipady=15);ttk.Button(b,text='STOP / SHUTDOWN',command=self.stop).grid(row=0,column=1,padx=20,ipadx=20,ipady=15);ttk.Button(b,text='RESET SYSTEM',command=self.reset).grid(row=0,column=2,padx=20,ipadx=20,ipady=15)
+        style = ttk.Style()
+        style.configure('Big.TLabel', font=('TkDefaultFont', 20, 'bold'))
+        style.configure('Value.TLabel', font=('TkDefaultFont', 16))
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill='both', expand=True, padx=8, pady=8)
+
+        self.over = ttk.Frame(nb)
+        self.manual = ttk.Frame(nb)
+        self.data = ttk.Frame(nb)
+        self.settings = ttk.Frame(nb)
+
+        for f, n in [
+            (self.over, 'Overview'),
+            (self.manual, 'Manual Control'),
+            (self.data, 'Data'),
+            (self.settings, 'Settings')
+        ]:
+            nb.add(f, text=n)
+
+        # =========================
+        # Overview
+        # =========================
+
+        self.status = tk.StringVar(value='Discovering Arduinos...')
+        ttk.Label(
+            self.over,
+            textvariable=self.status,
+            style='Big.TLabel'
+        ).pack(pady=20)
+
+        self.phase = tk.StringVar(value='State: IDLE')
+        ttk.Label(
+            self.over,
+            textvariable=self.phase,
+            style='Value.TLabel'
+        ).pack(pady=8)
+
+        self.safety = tk.StringVar(value='Safety: UNKNOWN')
+        ttk.Label(
+            self.over,
+            textvariable=self.safety,
+            style='Value.TLabel'
+        ).pack(pady=8)
+
+        self.sensors = tk.StringVar(
+            value='Temp -- C   RH -- %   Pressure -- psig'
+        )
+        ttk.Label(
+            self.over,
+            textvariable=self.sensors,
+            style='Value.TLabel'
+        ).pack(pady=8)
+
+        ttk.Label(
+            self.over,
+            textvariable=self.last_control_message
+        ).pack(pady=4)
+
+        b = ttk.Frame(self.over)
+        b.pack(pady=25)
+
+        ttk.Button(
+            b,
+            text='START',
+            command=self.start
+        ).grid(row=0, column=0, padx=20, ipadx=30, ipady=15)
+
+        ttk.Button(
+            b,
+            text='STOP / SHUTDOWN',
+            command=self.stop
+        ).grid(row=0, column=1, padx=20, ipadx=20, ipady=15)
+
+        ttk.Button(
+            b,
+            text='RESET SYSTEM',
+            command=self.reset
+        ).grid(row=0, column=2, padx=20, ipadx=20, ipady=15)
+
         self.retry_finalize_button = ttk.Button(
             self.over,
             text="RETRY FINALIZATION",
@@ -59,29 +130,208 @@ class App(tk.Tk):
             state="disabled"
         )
         self.retry_finalize_button.pack(pady=5)
-        ttk.Label(self.manual,text='Manual controls require MODE,MANUAL and physical switch ON.',style='Value.TLabel').pack(pady=15)
-        grid=ttk.Frame(self.manual);grid.pack(pady=10)
-        for r,name in enumerate(['ADSORB','DESORB','BELLOWS_EVAC','BELLOWS_TANK','VACUUM','STATE_CHANGE']):
-            ttk.Label(grid,text=name,width=18).grid(row=r,column=0,padx=5,pady=5);ttk.Button(grid,text='ON',command=lambda n=name:self.output(n,1)).grid(row=r,column=1,padx=5);ttk.Button(grid,text='OFF',command=lambda n=name:self.output(n,0)).grid(row=r,column=2,padx=5)
-        ttk.Button(self.manual,text='Enter Manual Mode',command=lambda:self.send('CONTROL','MODE,MANUAL')).pack(pady=10);ttk.Button(self.manual,text='Return Auto Mode',command=lambda:self.send('CONTROL','MODE,AUTO')).pack()
-        self.live=tk.StringVar(value='CO2 -- %    Flow -- SLPM'); ttk.Label(self.data,textvariable=self.live,style='Big.TLabel').pack(pady=20)
-        self.totals=tk.StringVar(value='Pi CO2: -- g    Arduino CO2: -- g'); ttk.Label(self.data,textvariable=self.totals,style='Value.TLabel').pack(pady=10)
-        self.filelabel=tk.StringVar(value='Logging: waiting for desorption'); ttk.Label(self.data,textvariable=self.filelabel).pack(pady=10)
-        self.timing=tk.StringVar(value='Timing: waiting for synchronization'); ttk.Label(self.data,textvariable=self.timing).pack(pady=5)
-        ttk.Label(self.data,text='Optional run name / notes for filename:').pack(); ttk.Entry(self.data,textvariable=self.note,width=60).pack(pady=5)
-        form=ttk.Frame(self.settings);form.pack(pady=30)
-        for i,(name,var) in enumerate(zip(['Adsorb','Evacuation','Desorption'],self.times)):
-            ttk.Label(form,text=name+' (HH:MM:SS)').grid(row=i,column=0,padx=10,pady=10);ttk.Entry(form,textvariable=var,width=12).grid(row=i,column=1,padx=10)
-        ttk.Button(form,text='Apply Cycle Settings',command=self.apply_times).grid(row=3,column=0,columnspan=2,pady=20)
-        safety_box=ttk.LabelFrame(self.settings,text='Safety Settings'); safety_box.pack(fill='x',padx=30,pady=15)
-        safety_labels=['MAX6675 temperature limit (C)','Incoming humidity limit (% RH)','Humidity trip delay (HH:MM:SS)','Desorption pressure limit (psig)','Pressure trip delay (HH:MM:SS)','Sensor reporting loss delay (HH:MM:SS)']
-        for i,(label,var) in enumerate(zip(safety_labels,self.safety_vars)):
-            ttk.Label(safety_box,text=label).grid(row=i,column=0,sticky='w',padx=10,pady=6); ttk.Entry(safety_box,textvariable=var,width=14).grid(row=i,column=1,padx=10,pady=6)
-        ttk.Button(safety_box,text='Apply Safety Settings',command=self.apply_safety).grid(row=len(safety_labels),column=0,columnspan=2,pady=12)
-        self.safety_config_status=tk.StringVar(value='Active safety configuration: waiting for SAFETY Arduino')
-        ttk.Label(safety_box,textvariable=self.safety_config_status).grid(row=len(safety_labels)+1,column=0,columnspan=2,padx=10,pady=6)
-        ttk.Label(self.settings,text='Safety settings are applied to the SAFETY Arduino for the current powered session.').pack(pady=4)
-        ttk.Label(self.settings,text='CSV folder: ' + str(self.experiment_manager.data_dir)).pack(pady=10)
+
+        # =========================
+        # Manual Control
+        # =========================
+
+        ttk.Label(
+            self.manual,
+            text='Manual controls require MODE,MANUAL and physical switch ON.',
+            style='Value.TLabel'
+        ).pack(pady=15)
+
+        grid = ttk.Frame(self.manual)
+        grid.pack(pady=10)
+
+        manual_outputs = [
+            'ADSORB',
+            'DESORB',
+            'BELLOWS_EVAC',
+            'BELLOWS_TANK',
+            'VACUUM',
+            'AWH',
+            'DESORPTION_HEATER'
+        ]
+
+        for r, name in enumerate(manual_outputs):
+
+            ttk.Label(
+                grid,
+                text=name,
+                width=22
+            ).grid(row=r, column=0, padx=5, pady=5)
+
+            ttk.Button(
+                grid,
+                text='ON',
+                command=lambda n=name: self.output(n, 1)
+            ).grid(row=r, column=1, padx=5)
+
+            ttk.Button(
+                grid,
+                text='OFF',
+                command=lambda n=name: self.output(n, 0)
+            ).grid(row=r, column=2, padx=5)
+
+            self.output_status_vars[name] = tk.StringVar(value='Unknown')
+
+            ttk.Label(
+                grid,
+                textvariable=self.output_status_vars[name],
+                width=12
+            ).grid(row=r, column=3, padx=10)
+
+        ttk.Button(
+            self.manual,
+            text='Enter Manual Mode',
+            command=lambda: self.send('CONTROL', 'MODE,MANUAL')
+        ).pack(pady=10)
+
+        ttk.Button(
+            self.manual,
+            text='Return Auto Mode',
+            command=lambda: self.send('CONTROL', 'MODE,AUTO')
+        ).pack()
+
+        # =========================
+        # Data
+        # =========================
+
+        self.live = tk.StringVar(value='CO2 -- %    Flow -- SLPM')
+        ttk.Label(
+            self.data,
+            textvariable=self.live,
+            style='Big.TLabel'
+        ).pack(pady=20)
+
+        self.totals = tk.StringVar(
+            value='Pi CO2: -- g    Arduino CO2: -- g'
+        )
+        ttk.Label(
+            self.data,
+            textvariable=self.totals,
+            style='Value.TLabel'
+        ).pack(pady=10)
+
+        self.filelabel = tk.StringVar(
+            value='Logging: waiting for desorption'
+        )
+        ttk.Label(
+            self.data,
+            textvariable=self.filelabel
+        ).pack(pady=10)
+
+        self.timing = tk.StringVar(
+            value='Timing: waiting for synchronization'
+        )
+        ttk.Label(
+            self.data,
+            textvariable=self.timing
+        ).pack(pady=5)
+
+        ttk.Label(
+            self.data,
+            text='Optional run name / notes for filename:'
+        ).pack()
+
+        ttk.Entry(
+            self.data,
+            textvariable=self.note,
+            width=60
+        ).pack(pady=5)
+
+        # =========================
+        # Settings
+        # =========================
+
+        form = ttk.Frame(self.settings)
+        form.pack(pady=30)
+
+        for i, (name, var) in enumerate(
+            zip(['Adsorb', 'Evacuation', 'Desorption'], self.times)
+        ):
+            ttk.Label(
+                form,
+                text=name + ' (HH:MM:SS)'
+            ).grid(row=i, column=0, padx=10, pady=10)
+
+            ttk.Entry(
+                form,
+                textvariable=var,
+                width=12
+            ).grid(row=i, column=1, padx=10)
+
+        ttk.Button(
+            form,
+            text='Apply Cycle Settings',
+            command=self.apply_times
+        ).grid(row=3, column=0, columnspan=2, pady=20)
+
+        safety_box = ttk.LabelFrame(
+            self.settings,
+            text='Safety Settings'
+        )
+        safety_box.pack(fill='x', padx=30, pady=15)
+
+        safety_labels = [
+            'MAX6675 temperature limit (C)',
+            'Incoming humidity limit (% RH)',
+            'Humidity trip delay (HH:MM:SS)',
+            'Desorption pressure limit (psig)',
+            'Pressure trip delay (HH:MM:SS)',
+            'Sensor reporting loss delay (HH:MM:SS)'
+        ]
+
+        for i, (label, var) in enumerate(
+            zip(safety_labels, self.safety_vars)
+        ):
+            ttk.Label(
+                safety_box,
+                text=label
+            ).grid(row=i, column=0, sticky='w', padx=10, pady=6)
+
+            ttk.Entry(
+                safety_box,
+                textvariable=var,
+                width=14
+            ).grid(row=i, column=1, padx=10, pady=6)
+
+        ttk.Button(
+            safety_box,
+            text='Apply Safety Settings',
+            command=self.apply_safety
+        ).grid(
+            row=len(safety_labels),
+            column=0,
+            columnspan=2,
+            pady=12
+        )
+
+        self.safety_config_status = tk.StringVar(
+            value='Active safety configuration: waiting for SAFETY Arduino'
+        )
+
+        ttk.Label(
+            safety_box,
+            textvariable=self.safety_config_status
+        ).grid(
+            row=len(safety_labels) + 1,
+            column=0,
+            columnspan=2,
+            padx=10,
+            pady=6
+        )
+
+        ttk.Label(
+            self.settings,
+            text='Safety settings are applied to the SAFETY Arduino for the current powered session.'
+        ).pack(pady=4)
+
+        ttk.Label(
+            self.settings,
+            text='CSV folder: ' + str(self.experiment_manager.data_dir)
+        ).pack(pady=10)
     def discover(self):
         if serial is None: self.status.set('pyserial is not installed'); return
         while True:
@@ -203,10 +453,56 @@ class App(tk.Tk):
         if role=='CONTROL':
             if line.startswith('STATE,'):
                 phase=p[1]; self.set_phase(phase)
-            elif line.startswith('STATUS,CONTROL') and len(p)>4:
-                phase=p[4];
-                if phase in ('ADSORB','EVACUATION','DESORB') and phase!=self.current_phase:self.set_phase(phase)
-                self.phase.set('State: '+p[3]+' / '+phase+'   Remaining: '+self.hms(int(p[5]) if len(p)>5 and p[5].isdigit() else 0))
+
+            elif line.startswith('STATUS,CONTROL') and len(p) > 5:
+
+                # Update current operating phase
+                phase = p[4]
+
+                if phase in ('ADSORB', 'EVACUATION', 'DESORB') and phase != self.current_phase:
+                    self.set_phase(phase)
+
+                # Update cycle status and remaining time
+                remaining = int(p[5]) if p[5].isdigit() else 0
+
+                self.phase.set(
+                    f'State: {p[3]} / {phase}   Remaining: {self.hms(remaining)}'
+                )
+
+                # Parse Arduino output status fields
+                status_values = {}
+
+                for item in p[6:]:
+                    if '=' in item:
+                        key, value = item.split('=', 1)
+                        status_values[key] = value
+
+                # Map GUI names to Arduino output names
+                output_mapping = {
+                    'ADSORB': 'ADSORB',
+                    'DESORB': 'DESORB',
+                    'BELLOWS_EVAC': 'BELLOWS_EVAC',
+                    'BELLOWS_TANK': 'BELLOWS_TANK',
+                    'VACUUM': 'VACUUM',
+                    'AWH': 'AWH',
+                    'DESORPTION_HEATER': 'HEATER'
+                }
+
+                # Update the Manual Control status indicators
+                for gui_name, arduino_name in output_mapping.items():
+
+                    if gui_name not in self.output_status_vars:
+                        continue
+
+                    value = status_values.get(arduino_name)
+
+                    if value == '1':
+                        self.output_status_vars[gui_name].set('ON')
+
+                    elif value == '0':
+                        self.output_status_vars[gui_name].set('OFF')
+
+
         elif role=='SAFETY' and line.startswith('STATUS,SAFETY'):
             try:self.safety.set('Safety: '+p[2]);self.sensors.set(f'MAX6675 {p[3]} C   Pressure {p[4]} psig   Inlet {p[5]} C   RH {p[6]} %')
             except:pass
@@ -755,7 +1051,12 @@ class App(tk.Tk):
         if self.reset_pending and time.monotonic()>=self.reset_deadline:
             self.reset_pending=False
             messagebox.showerror('Reset timeout','No SAFETY reset acknowledgement was received. Check the Safety Arduino and active fault conditions.')
-    def output(self,n,v): self.send('CONTROL',f'SET_OUTPUT,{n},{v}')
+    def output(self, n, v):
+        command_name = {
+            'DESORPTION_HEATER': 'HEATER'
+        }.get(n, n)
+
+        self.send('CONTROL', f'SET_OUTPUT,{command_name},{v}')
     def apply_times(self):
         try: vals=[self.to_s(v.get()) for v in self.times];self.send('CONTROL','SET_TIMES,'+','.join(map(str,vals)))
         except ValueError: messagebox.showerror('Invalid time','Use HH:MM:SS for all three times.')
