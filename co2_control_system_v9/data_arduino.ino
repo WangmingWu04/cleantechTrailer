@@ -34,5 +34,18 @@ void refreshDisplay(){
 void sendData(){if(!valid||!loggingActive||millis()-lastSendMs<SEND_MS)return;lastSendMs=millis();Serial.print(F("DATA,"));Serial.print(millis()-logStartMs);Serial.print(',');Serial.print(latestPercent*100,4);Serial.print(',');Serial.print(latestFlow,4);Serial.print(',');Serial.print(totalG,6);Serial.print(',');Serial.println(totalG/CO2_MOLAR_MASS,8);}
 void sendLiveData(){if(!valid||loggingActive||millis()-lastLiveMs<LIVE_MS)return;lastLiveMs=millis();Serial.print(F("LIVE,"));Serial.print(latestPercent*100,4);Serial.print(',');Serial.println(latestFlow,4);}
 void readPi(){while(Serial.available()){char c=Serial.read();if(c=='\n'){cmdBuf[cmdIdx]=0;processCmd(cmdBuf);cmdIdx=0;}else if(c!='\r'&&cmdIdx<49)cmdBuf[cmdIdx++]=c;}}
-void processCmd(char*c){if(!strcmp(c,"IDENTIFY")){Serial.println(F("ID,DATA"));return;}if(!strcmp(c,"GET_STATUS")){sendStatus();return;}if(!strcmp(c,"START_LOG")){totalG=0;completedLog=false;logStartMs=millis();lastCO2Ms=millis();lastSendMs=millis()-SEND_MS;loggingActive=true;Serial.print(F("LOG_STARTED,"));Serial.println(logStartMs);return;}if(!strcmp(c,"STOP_LOG")){loggingActive=false;completedLog=true;Serial.println(F("OK,LOG_STOPPED"));return;}Serial.println(F("ERROR,UNKNOWN_COMMAND"));}
+void processCmd(char*c){if(!strcmp(c,"IDENTIFY")){Serial.println(F("ID,DATA"));return;}if(!strcmp(c,"GET_STATUS")){sendStatus();return;}if(!strcmp(c,"START_LOG")){
+    if(!loggingActive){
+        totalG=0;
+        completedLog=false;
+        logStartMs=millis();
+        lastCO2Ms=millis();
+        lastSendMs=millis()-SEND_MS;
+        loggingActive=true;
+    }
+
+    Serial.print(F("LOG_STARTED,"));
+    Serial.println(logStartMs);
+    return;
+}if(!strcmp(c,"STOP_LOG")){loggingActive=false;completedLog=true;Serial.println(F("OK,LOG_STOPPED"));return;}Serial.println(F("ERROR,UNKNOWN_COMMAND"));}
 void sendStatus(){Serial.print(F("STATUS,DATA,"));Serial.print(valid?F("OK"):F("NO_DATA"));Serial.print(',');Serial.print(loggingActive?F("LOGGING"):F("IDLE"));Serial.print(',');if(valid)Serial.print(latestPercent*100,4);else Serial.print(F("NA"));Serial.print(',');Serial.print(latestFlow,4);Serial.print(',');Serial.print(totalG,6);Serial.print(',');Serial.println(totalG/CO2_MOLAR_MASS,8);}

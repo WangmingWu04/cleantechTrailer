@@ -2,7 +2,7 @@ CO2 CONTROL SYSTEM - V6
 
 Files:
 - control_arduino.ino : CONTROL Arduino firmware
-- data_arduino.ino    : DATA Arduino firmware, 1 Hz desorption logging
+- data_arduino.ino    : DATA Arduino firmware, 1 Hz experiment logging
 - safety_arduino.ino  : SAFETY Arduino firmware
 - co2_pi_app.py       : Raspberry Pi 4 / Raspberry Pi OS GUI
 
@@ -22,10 +22,14 @@ Pi communication:
 - Safety settings are editable in GUI and active for current powered SAFETY session.
 
 Data:
-- DATA transmits at 1 Hz during desorption logging.
-- Pi synchronizes real-world timestamp to DATA Arduino elapsed millis at START_LOG.
-- Pi independently integrates CO2 using trapezoidal integration.
-- CSVs stored by default in ~/CO2_Data and named by desorption start date/time plus optional experiment name.
+- Pressing START creates the experiment folder and initial CSV files before the automatic cycle begins.
+- The Pi retries creation of the experiment folder and startup files up to three times. If setup still fails, it reports the error and does not start the experiment.
+- START_LOG is requested before the automatic cycle begins and retried up to three times if the DATA Arduino does not confirm it.
+- DATA transmits at 1 Hz while logging, including ADSORB and EVACUATION phases, not only DESORB.
+- The Pi synchronizes real-world timestamps to DATA Arduino elapsed milliseconds at START_LOG and independently integrates CO2 using trapezoidal integration.
+- The CO2 CSV is initialized before the CONTROL Arduino starts the automatic cycle. If CSV opening fails, the Pi retries up to three times and aborts startup if it still cannot open the file.
+- A CO2 CSV write or flush failure stops logging, reports the error, and requests the normal evacuation shutdown. The experiment is marked aborted after shutdown completes.
+- Experiment data is stored under the project's CO2_Data directory by default, in a timestamped folder with an optional experiment name.
 
 Python dependencies:
   python3, python3-tk, pyserial
@@ -60,4 +64,5 @@ V9 changes:
 - Safety Arduino pressure sensor input changed to A2.
 - Data Arduino sends LIVE,CO2%,SLPM at 1 Hz outside desorption logging.
 - Pi Data screen displays LIVE measurements without writing them to CSV or integrating them.
-- Existing DATA stream, timestamp synchronization, CSV logging, and CO2 integration remain desorption-only.
+- DATA logging starts before the automatic cycle, records across all cycle phases, and uses the experiment folder created when START is pressed.
+- Runtime CO2 CSV write/flush failures request normal evacuation and mark the experiment aborted.

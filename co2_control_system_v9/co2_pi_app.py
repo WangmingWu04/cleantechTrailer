@@ -15,15 +15,33 @@ BAUD=115200
 COMM_TIMEOUT=5.0
 HEARTBEAT_INTERVAL=1.0
 WEATHER_INTERVAL = 30.0
+LOG_START_MAX_ATTEMPTS = 3
+LOG_START_RETRY_MS = 1000
+CSV_OPEN_MAX_ATTEMPTS = 3
+CSV_OPEN_RETRY_MS = 1000
 CO2_MOLAR_MASS=44.01
 MOLAR_VOLUME_STP=22.414
 CO2_G_PER_SL=CO2_MOLAR_MASS/MOLAR_VOLUME_STP
 
 class Device:
-    def __init__(self,port,role,ser): self.port,self.role,self.ser=port,role,ser; self.last=time.monotonic(); self.q=queue.Queue(); self.alive=True
-    def send(self,s):
-        try:self.ser.write((s+'\n').encode())
-        except Exception: self.alive=False
+    def __init__(self, port, role, ser):
+        self.port = port
+        self.role = role
+        self.ser = ser
+        self.last = time.monotonic()
+        self.q = queue.Queue()
+        self.alive = True
+
+    def send(self, s):
+        try:
+            self.ser.write((s + '\n').encode())
+            self.ser.flush()
+            return True
+
+        except Exception as e:
+            self.alive = False
+            print(f"{self.role} serial send failed: {e}")
+            return False
 
 class App(tk.Tk):
     def __init__(self):
@@ -37,8 +55,9 @@ class App(tk.Tk):
         self.last_weather_timestamp = None
         self.status_log_lock = threading.Lock()
         self.finalization_in_progress = False
+        self.final_status_after_shutdown = 'completed'
         self.weather_stop_event = threading.Event()
-        self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.csv_logging_error=None; self.csv_error_notified=False; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.pending_desorb_start=False; self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
+        self.title('CO2 System Control'); self.minsize(900,600); self.state_data={}; self.devices={}; self.current_phase='IDLE'; self.logging=False; self.csvfile=None; self.writer=None; self.csv_logging_error=None; self.csv_error_notified=False; self.pi_g=0.0; self.prev_gps=None; self.prev_ms=None; self.note=tk.StringVar(); self.times=[tk.StringVar(value=x) for x in ('04:00:00','00:00:55','00:55:00')]; self.sync_send_time=None; self.sync_time=None; self.sync_arduino_start_ms=None; self.startup_in_progress = False;self.last_heartbeat=0.0; self.reset_pending=False; self.reset_deadline=0.0; self.last_control_message=tk.StringVar(value='Controller response: --'); self.safety_vars=[tk.StringVar(value=x) for x in ('150.0','30.0','00:05:00','0.0','00:05:00','00:00:15')]
         self.output_status_vars = {}
         self.build(); self.after(100,self.poll); threading.Thread(target=self.discover,daemon=True).start()
 
@@ -391,9 +410,13 @@ class App(tk.Tk):
                 line=d.ser.readline().decode(errors='ignore').strip()
                 if line:d.last=time.monotonic();d.q.put(line)
             except Exception:d.alive=False
-    def send(self,role,cmd):
-        d=self.devices.get(role)
-        if d and d.alive:d.send(cmd)
+    def send(self, role, cmd):
+        d = self.devices.get(role)
+
+        if d and d.alive:
+            return d.send(cmd)
+
+        return False
     def poll(self):
         now=time.monotonic(); connected=[]
         # Heartbeat: all three Arduinos answer GET_STATUS. This keeps last-seen
@@ -437,7 +460,9 @@ class App(tk.Tk):
 
             elif line == 'SHUTDOWN,COMPLETE':
                 self.log_status('CONTROL', line)
-                self.finalize_experiment('completed')
+                final_status = self.final_status_after_shutdown
+                self.final_status_after_shutdown = 'completed'
+                self.finalize_experiment(final_status)
 
             elif line == 'EMERGENCY,LOCKOUT':
                 self.log_status('CONTROL', line)
@@ -525,33 +550,140 @@ class App(tk.Tk):
             except (ValueError, IndexError): pass
         elif role=='DATA' and line.startswith('DATA,'): self.data_row(p)
 
-    def set_phase(self,phase):
-        old=self.current_phase; self.current_phase=phase
-        safety_phase = phase if phase in ('ADSORB','EVACUATION','DESORB') else 'IDLE'
-        self.send('SAFETY','PHASE,'+safety_phase)
-        if phase=='DESORB' and old!='DESORB':
-            self.begin_log_sync()
-        elif old=='DESORB' and phase!='DESORB':
-            self.send('DATA','STOP_LOG'); self.close_csv()
+    def set_phase(self, phase):
+        self.current_phase = phase
+
+        safety_phase = (
+            phase if phase in ('ADSORB', 'EVACUATION', 'DESORB')
+            else 'IDLE'
+        )
+
+        self.send('SAFETY', 'PHASE,' + safety_phase)
     def begin_log_sync(self):
-        self.pending_desorb_start=True
-        self.sync_time=None
-        self.sync_arduino_start_ms=None
-        self.sync_send_time=datetime.now().astimezone()
+        self.pending_log_start = True
+        self.log_start_attempts = 0
+        self.sync_time = None
+        self.sync_arduino_start_ms = None
+        self.sync_send_time = None
+
         self.timing.set('Timing: synchronizing with DATA Arduino...')
-        self.send('DATA','START_LOG')
-    def finish_log_sync(self,p):
-        if not self.pending_desorb_start or len(p)<2: return
-        try: arduino_start=int(p[1])
-        except ValueError: return
-        receive_time=datetime.now().astimezone()
-        if self.sync_send_time is None: self.sync_send_time=receive_time
-        self.sync_time=self.sync_send_time+(receive_time-self.sync_send_time)/2
-        self.sync_arduino_start_ms=arduino_start
-        self.pending_desorb_start=False
-        rtt_ms=(receive_time-self.sync_send_time).total_seconds()*1000.0
-        self.open_csv()
-        self.timing.set(f'Timing: SYNCHRONIZED   START RTT {rtt_ms:.1f} ms')
+        self.send_start_log_attempt()
+
+
+    def send_start_log_attempt(self):
+        if not self.pending_log_start:
+            return
+
+        if self.log_start_attempts >= LOG_START_MAX_ATTEMPTS:
+            self.pending_log_start = False
+
+            messagebox.showerror(
+                "DATA Logging Start Failed",
+                f"DATA Arduino did not confirm START_LOG after "
+                f"{LOG_START_MAX_ATTEMPTS} attempts. "
+                "The experiment will be aborted."
+            )
+
+            self.finalize_experiment('aborted')
+            return
+
+        self.log_start_attempts += 1
+        sent_at = datetime.now().astimezone()
+
+        if self.send('DATA', 'START_LOG'):
+            if self.sync_send_time is None:
+                self.sync_send_time = sent_at
+
+            print(
+                f"START_LOG sent "
+                f"(attempt {self.log_start_attempts}/{LOG_START_MAX_ATTEMPTS})."
+            )
+        else:
+            print(
+                f"START_LOG send failed "
+                f"(attempt {self.log_start_attempts}/{LOG_START_MAX_ATTEMPTS})."
+            )
+
+        self.after(
+            LOG_START_RETRY_MS,
+            self.send_start_log_attempt
+        )
+    def finish_log_sync(self, p):
+        if not self.pending_log_start or len(p) < 2:
+            return
+
+        try:
+            arduino_start = int(p[1])
+        except ValueError:
+            return
+
+        receive_time = datetime.now().astimezone()
+
+        if self.sync_send_time is None:
+            self.sync_send_time = receive_time
+
+        self.sync_time = (
+            self.sync_send_time
+            + (receive_time - self.sync_send_time) / 2
+        )
+
+        self.sync_arduino_start_ms = arduino_start
+        self.pending_log_start = False
+
+        rtt_ms = (
+            receive_time - self.sync_send_time
+        ).total_seconds() * 1000.0
+
+        self.open_csv_with_retry(rtt_ms)
+
+    def open_csv_with_retry(self, rtt_ms, attempt=1):
+        if (
+            not self.experiment_active
+            or not self.startup_in_progress
+            or self.experiment_stopping
+        ):
+            return
+
+        if self.open_csv():
+            self.timing.set(
+                f'Timing: SYNCHRONIZED   START RTT {rtt_ms:.1f} ms'
+            )
+
+            self.send('CONTROL', 'MODE,AUTO')
+            self.after(150, self.send_control_start)
+            return
+
+        if attempt < CSV_OPEN_MAX_ATTEMPTS:
+            print(
+                f"CSV open failed. Retrying "
+                f"({attempt + 1}/{CSV_OPEN_MAX_ATTEMPTS})..."
+            )
+
+            self.after(
+                CSV_OPEN_RETRY_MS,
+                lambda: self.open_csv_with_retry(rtt_ms, attempt + 1)
+            )
+            return
+
+        messagebox.showerror(
+            "CO2 CSV Logging Failed",
+            f"Could not open the CO2 CSV file after "
+            f"{CSV_OPEN_MAX_ATTEMPTS} attempts. "
+            "The experiment will be aborted."
+        )
+
+        self.finalize_experiment('aborted')
+
+    def send_control_start(self):
+        if (
+            not self.experiment_active
+            or not self.startup_in_progress
+            or self.experiment_stopping
+        ):
+            return
+
+        self.send('CONTROL', 'START')
+        self.startup_in_progress = False
 
     def open_csv(self):
         self.pi_g = 0
@@ -564,7 +696,7 @@ class App(tk.Tk):
                 "CO2 Logging Error",
                 "Cannot start CO2 logging: no active experiment."
             )
-            return
+            return False
 
         # Reset the error state for this new logging session.
         self.csv_logging_error = None
@@ -578,9 +710,10 @@ class App(tk.Tk):
                 self.writer = None
             except Exception as e:
                 self.handle_csv_logging_error(
-                    OSError(f"Previous CSV file could not be closed: {e}")
+                    OSError(f"Previous CSV file could not be closed: {e}"),
+                    show_warning=False
                 )
-                return
+                return False
 
         try:
             path = self.experiment_manager.get_file_path("co2")
@@ -619,15 +752,19 @@ class App(tk.Tk):
             # Enable logging only after initialization succeeds.
             self.logging = True
             self.filelabel.set('Recording: ' + str(path))
+            return True
 
         except Exception as e:
-            self.handle_csv_logging_error(e)
+            self.handle_csv_logging_error(e, show_warning=False)
+            return False
 
     def close_csv(self):
         self.logging=False
         if self.csvfile:self.csvfile.close();self.csvfile=None;self.writer=None
 
-    def handle_csv_logging_error(self, error):
+    def handle_csv_logging_error(
+        self, error, show_warning=True, abort_experiment=False
+    ):
         self.logging = False
         self.csv_logging_error = str(error)
 
@@ -652,13 +789,34 @@ class App(tk.Tk):
                 )
 
         # Show only one warning for this logging failure.
-        if not self.csv_error_notified:
+        if show_warning and not self.csv_error_notified:
             self.csv_error_notified = True
             messagebox.showwarning(
                 "CO2 CSV Logging Error",
-                f"CSV recording has stopped:\n{self.csv_logging_error}\n\n"
-                "The CO2 experiment will continue, but its data may be incomplete."
+                f"CSV recording has stopped:\n{self.csv_logging_error}"
             )
+
+        # Abort an active experiment if runtime CO2 CSV logging fails.
+        if self.experiment_active and abort_experiment:
+            self.final_status_after_shutdown = 'aborted'
+
+            self.log_status(
+                'DATA',
+                f'CO2_CSV_LOGGING_FAILED: {self.csv_logging_error}'
+            )
+
+            if self.experiment_stopping:
+                print(
+                    "CO2 CSV logging failed while shutdown was already "
+                    "in progress. The experiment will be marked aborted "
+                    "after shutdown completes."
+                )
+            else:
+                print(
+                    "CO2 CSV logging failed. Requesting normal shutdown "
+                    "and evacuation."
+                )
+                self.stop()
 
     def live_data(self,p):
         try:
@@ -715,7 +873,7 @@ class App(tk.Tk):
             )
 
         except Exception as e:
-            print("CO2 data processing error:", e)
+            self.handle_csv_logging_error(e)
             return
 
         # Handle CSV errors separately from data-processing errors.
@@ -737,7 +895,10 @@ class App(tk.Tk):
                 self.csvfile.flush()
 
             except Exception as e:
-                self.handle_csv_logging_error(e)
+                self.handle_csv_logging_error(
+                    e,
+                    abort_experiment=True
+                )
 
     def handle_safety_config(self,p):
         try:
@@ -808,6 +969,9 @@ class App(tk.Tk):
                 experiment_name=self.note.get().strip()
             )
             self.experiment_active = True
+            self.startup_in_progress = True
+            self.experiment_stopping = False
+            self.final_status_after_shutdown = 'completed'
 
         except Exception as e:
             messagebox.showerror(
@@ -844,8 +1008,7 @@ class App(tk.Tk):
                 f"Weather collection could not start:\n{e}\n\n"
                 "The CO2 experiment will continue without weather data."
             )
-        self.send('CONTROL', 'MODE,AUTO')
-        self.after(150, lambda: self.send('CONTROL', 'START'))
+        self.begin_log_sync()
 
     def finalize_experiment(self, status):
         if self.finalization_in_progress:
@@ -857,6 +1020,8 @@ class App(tk.Tk):
         if status not in ("completed", "aborted"):
             raise ValueError("Invalid experiment finalization status.")
 
+        self.pending_log_start = False
+        self.startup_in_progress = False
         self.finalization_in_progress = True
 
         print(f"Finalizing experiment: {status}")
@@ -1011,6 +1176,18 @@ class App(tk.Tk):
 
         control_device = self.devices.get('CONTROL')
 
+        # Cancel startup if the automatic experiment has not started yet.
+        if self.startup_in_progress:
+            self.experiment_stopping = True
+            self.pending_log_start = False
+            self.startup_in_progress = False
+
+            self.log_status("CONTROL", "STARTUP_CANCELLED_BY_STOP")
+            print("Startup cancelled. The experiment will be aborted.")
+
+            self.finalize_experiment('aborted')
+            return
+
         if not control_device or not control_device.alive:
             messagebox.showwarning(
                 "Communication Error",
@@ -1022,13 +1199,26 @@ class App(tk.Tk):
             )
             return
 
-        self.experiment_stopping = True
-
         self.log_status("CONTROL", "STOP_REQUESTED")
 
-        self.send('CONTROL', 'STOP')
+        if not self.send('CONTROL', 'STOP'):
+            self.experiment_stopping = False
 
-        print("Stop requested. Waiting for Arduino evacuation to complete.")
+            self.log_status(
+                "CONTROL",
+                "STOP_REQUEST_FAILED: serial send failed"
+            )
+
+            messagebox.showerror(
+                "STOP Command Failed",
+                "Could not send STOP to the CONTROL Arduino. "
+                "Please check the serial connection."
+            )
+            return
+
+        self.experiment_stopping = True
+
+        print("STOP command sent. Waiting for Arduino evacuation to complete.")
 
     def reset(self):
         if self.reset_pending: return

@@ -2,8 +2,11 @@
 import csv
 import json
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
+
+STARTUP_FILE_MAX_ATTEMPTS = 3
 
 
 class ExperimentManager:
@@ -16,9 +19,6 @@ class ExperimentManager:
             self.data_dir = project_root / "CO2_Data"
         else:
             self.data_dir = Path(data_dir)
-
-        # Create the data directory if it does not exist
-        self.data_dir.mkdir(parents=True, exist_ok=True)
 
         self.current_experiment_path = None
         self.experiment_info = None
@@ -45,15 +45,6 @@ class ExperimentManager:
         if safe_name:
             folder_name += f"_{safe_name}"
 
-        experiment_path = self.data_dir / folder_name
-
-        suffix = 1
-        while experiment_path.exists():
-            experiment_path = self.data_dir / f"{folder_name}_{suffix}"
-            suffix += 1
-
-        experiment_path.mkdir(parents=True)
-
         experiment_info = {
             "experiment_name": experiment_name,
             "start_time": start_time.isoformat(),
@@ -61,52 +52,79 @@ class ExperimentManager:
             "status": "initializing"
         }
 
-        info_path = experiment_path / "experiment_info.json"
+        weather_headers = [
+            "timestamp",
+            "humidity",
+            "temperature",
+            "rainfall",
+            "wind_speed",
+            "wind_direction",
+            "solar_radiation",
+            "pressure",
+            "dew_point"
+        ]
 
-        try:
-            with open(info_path, "w", encoding="utf-8") as file:
-                json.dump(
-                    experiment_info,
-                    file,
-                    indent=4,
-                    ensure_ascii=False
+        last_error = None
+        for attempt in range(1, STARTUP_FILE_MAX_ATTEMPTS + 1):
+            experiment_path = None
+            try:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+
+                candidate = self.data_dir / folder_name
+                suffix = 1
+                while candidate.exists():
+                    candidate = self.data_dir / f"{folder_name}_{suffix}"
+                    suffix += 1
+
+                candidate.mkdir(parents=True)
+                experiment_path = candidate
+                info_path = experiment_path / "experiment_info.json"
+
+                with open(info_path, "w", encoding="utf-8") as file:
+                    json.dump(
+                        experiment_info,
+                        file,
+                        indent=4,
+                        ensure_ascii=False
+                    )
+
+                self._create_csv("weather", weather_headers, experiment_path)
+                self._create_empty_file("co2", experiment_path)
+                self._create_csv(
+                    "status",
+                    ["timestamp", "device", "raw_message"],
+                    experiment_path
                 )
 
-            weather_headers = [
-                "timestamp",
-                "humidity",
-                "temperature",
-                "rainfall",
-                "wind_speed",
-                "wind_direction",
-                "solar_radiation",
-                "pressure",
-                "dew_point"
-            ]
+                experiment_info["status"] = "running"
+                with open(info_path, "w", encoding="utf-8") as file:
+                    json.dump(
+                        experiment_info,
+                        file,
+                        indent=4,
+                        ensure_ascii=False
+                    )
+                break
 
-            self._create_csv("weather", weather_headers, experiment_path)
-            self._create_empty_file("co2", experiment_path)
+            except Exception as error:
+                last_error = error
+                if experiment_path is not None and experiment_path.exists():
+                    try:
+                        shutil.rmtree(experiment_path)
+                    except OSError as cleanup_error:
+                        last_error = RuntimeError(
+                            f"{error}; incomplete experiment folder "
+                            f"could not be removed: {cleanup_error}"
+                        )
 
-            self._create_csv(
-                "status",
-                ["timestamp", "device", "raw_message"],
-                experiment_path
-            )
-
-            experiment_info["status"] = "running"
-
-            with open(info_path, "w", encoding="utf-8") as file:
-                json.dump(
-                    experiment_info,
-                    file,
-                    indent=4,
-                    ensure_ascii=False
-                )
-
-        except Exception:
-            self.current_experiment_path = None
-            self.experiment_info = None
-            raise
+                if attempt == STARTUP_FILE_MAX_ATTEMPTS:
+                    self.current_experiment_path = None
+                    self.experiment_info = None
+                    raise RuntimeError(
+                        "Could not create the experiment folder and startup "
+                        f"files after {STARTUP_FILE_MAX_ATTEMPTS} attempts: "
+                        f"{last_error}"
+                    ) from error
 
         self.current_experiment_path = experiment_path
         self.experiment_info = experiment_info
