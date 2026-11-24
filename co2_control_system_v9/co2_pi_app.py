@@ -53,6 +53,10 @@ class App(tk.Tk):
         self.weather_logger = None
         self.weather_thread = None
         self.last_weather_timestamp = None
+        # Latest sensor data for the main CO2 CSV
+        self.latest_safety_data = None
+        self.latest_weather_data = None
+        self.sensor_data_lock = threading.Lock()
         self.status_log_lock = threading.Lock()
         self.finalization_in_progress = False
         self.final_status_after_shutdown = 'completed'
@@ -528,9 +532,30 @@ class App(tk.Tk):
                         self.output_status_vars[gui_name].set('OFF')
 
 
-        elif role=='SAFETY' and line.startswith('STATUS,SAFETY'):
-            try:self.safety.set('Safety: '+p[2]);self.sensors.set(f'MAX6675 {p[3]} C   Pressure {p[4]} psig   Inlet {p[5]} C   RH {p[6]} %')
-            except:pass
+        elif role == 'SAFETY' and line.startswith('STATUS,SAFETY'):
+            try:
+                # Update the existing GUI display
+                self.safety.set('Safety: ' + p[2])
+                self.sensors.set(
+                    f'MAX6675 {p[3]} C   Pressure {p[4]} psig   '
+                    f'Inlet {p[5]} C   RH {p[6]} %'
+                )
+
+                # Save the latest inlet temperature and humidity
+                if self.experiment_active:
+                    safety_data = {
+                        'timestamp': datetime.now().astimezone().isoformat(
+                            timespec='milliseconds'
+                        ),
+                        'inlet_temperature': float(p[5]),
+                        'inlet_humidity': float(p[6])
+                    }
+
+                    with self.sensor_data_lock:
+                        self.latest_safety_data = safety_data
+
+            except (ValueError, IndexError):
+                pass
         elif role=='SAFETY' and line.startswith('OK,SAFETY_RESET'):
             self.safety.set('Safety: reset accepted; verifying interlock...')
             if self.reset_pending:
@@ -734,6 +759,7 @@ class App(tk.Tk):
 
             if file_is_empty:
                 self.writer.writerow([
+                    # Existing CO2 data
                     'Calculated Timestamp',
                     'Pi Receive Timestamp',
                     'Arduino Elapsed (ms)',
@@ -744,7 +770,23 @@ class App(tk.Tk):
                     'Pi CO2 (g)',
                     'Difference (g)',
                     'Arduino CO2 (mol)',
-                    'Pi CO2 (mol)'
+                    'Pi CO2 (mol)',
+
+                    # Safety Arduino data
+                    'Safety Receive Timestamp',
+                    'Inlet Temperature (C)',
+                    'Inlet Humidity (%)',
+
+                    # Ambient Weather data
+                    'Weather Timestamp',
+                    'Weather Temperature (F)',
+                    'Weather Humidity (%)',
+                    'Weather Rainfall (in)',
+                    'Weather Wind Speed (mph)',
+                    'Weather Wind Direction (degrees)',
+                    'Weather Solar Radiation',
+                    'Weather Pressure (inHg)',
+                    'Weather Dew Point (F)'
                 ])
 
                 self.csvfile.flush()
@@ -879,7 +921,22 @@ class App(tk.Tk):
         # Handle CSV errors separately from data-processing errors.
         if self.logging and self.writer:
             try:
+                # Get consistent snapshots of the latest sensor data
+                with self.sensor_data_lock:
+                    safety_data = (
+                        dict(self.latest_safety_data)
+                        if self.latest_safety_data is not None
+                        else {}
+                    )
+
+                    weather_data = (
+                        dict(self.latest_weather_data)
+                        if self.latest_weather_data is not None
+                        else {}
+                    )
+
                 self.writer.writerow([
+                    # Existing CO2 data
                     calculated_time.isoformat(timespec='milliseconds'),
                     receive_time.isoformat(timespec='milliseconds'),
                     ms,
@@ -890,8 +947,25 @@ class App(tk.Tk):
                     self.pi_g,
                     ag - self.pi_g,
                     am,
-                    pm
+                    pm,
+
+                    # Safety Arduino data
+                    safety_data.get('timestamp', ''),
+                    safety_data.get('inlet_temperature', ''),
+                    safety_data.get('inlet_humidity', ''),
+
+                    # Ambient Weather data
+                    weather_data.get('timestamp', ''),
+                    weather_data.get('temperature', ''),
+                    weather_data.get('humidity', ''),
+                    weather_data.get('rainfall', ''),
+                    weather_data.get('wind_speed', ''),
+                    weather_data.get('wind_direction', ''),
+                    weather_data.get('solar_radiation', ''),
+                    weather_data.get('pressure', ''),
+                    weather_data.get('dew_point', '')
                 ])
+
                 self.csvfile.flush()
 
             except Exception as e:
@@ -946,8 +1020,14 @@ class App(tk.Tk):
                     timestamp = data["timestamp"]
 
                     if timestamp != self.last_weather_timestamp:
+                        # Keep the existing weather CSV logging
                         self.weather_logger.log_weather(data)
                         self.last_weather_timestamp = timestamp
+
+                        # Cache the latest weather data for the main CO2 CSV
+                        with self.sensor_data_lock:
+                            self.latest_weather_data = dict(data)
+
                         print("New weather data recorded:", timestamp)
                     else:
                         print("Duplicate weather data skipped:", timestamp)
@@ -972,6 +1052,13 @@ class App(tk.Tk):
             self.startup_in_progress = True
             self.experiment_stopping = False
             self.final_status_after_shutdown = 'completed'
+            # Reset sensor data caches for the new experiment
+            with self.sensor_data_lock:
+                self.latest_safety_data = None
+                self.latest_weather_data = None
+
+            # Reset weather timestamp tracking for the new experiment
+            self.last_weather_timestamp = None
 
         except Exception as e:
             messagebox.showerror(
